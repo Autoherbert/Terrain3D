@@ -60,6 +60,13 @@
 				You may wish to append .bind() to the callback to pass along variables. For instance internally this function is called when changing region size. We bind the destination Terrain3DRegion, then use do_for_regions to copy segments of source regions to segments of destination regions. See the code for change_region_size() for more.
 			</description>
 		</method>
+		<method name="enable_streaming">
+			<return type="int" enum="Error" />
+			<param index="0" name="capacity" type="int" />
+			<description>
+				Project Alpha fork. Switches to streaming mode for endless worlds. The height, control and color texture arrays are allocated once with [param capacity] layers, so adding, removing and moving regions no longer rebuilds them. Existing active regions keep their layers. Use the [code]stream_*[/code] methods afterwards instead of [method add_region], [method remove_region] and [method update_maps].
+			</description>
+		</method>
 		<method name="export_image" qualifiers="const">
 			<return type="int" enum="Error" />
 			<param index="0" name="file_name" type="String" />
@@ -301,6 +308,12 @@
 				Returns [code skip-lint]Color(NAN, NAN, NAN, NAN)[/code] if the position is outside of defined regions.
 			</description>
 		</method>
+		<method name="get_stream_capacity">
+			<return type="int" />
+			<description>
+				Project Alpha fork. Returns the number of texture array layers allocated by [method enable_streaming], or 0.
+			</description>
+		</method>
 		<method name="get_texture_id" qualifiers="const">
 			<return type="Vector3" />
 			<param index="0" name="global_position" type="Vector3" />
@@ -361,6 +374,12 @@
 			<param index="0" name="region_location" type="Vector2i" />
 			<description>
 				Returns true if the region at the location exists and is marked as modified. Syntactic sugar for [member Terrain3DRegion.modified].
+			</description>
+		</method>
+		<method name="is_streaming">
+			<return type="bool" />
+			<description>
+				Project Alpha fork. Returns true after [method enable_streaming] succeeded.
 			</description>
 		</method>
 		<method name="layered_to_image" qualifiers="const">
@@ -556,6 +575,36 @@
 			<param index="1" name="roughness" type="float" />
 			<description>
 				Sets the roughness modifier (wetness) on the color map alpha channel associated with the specified position. See [method set_pixel] for important information.
+			</description>
+		</method>
+		<method name="stream_add_region">
+			<return type="int" enum="Error" />
+			<param index="0" name="region" type="Terrain3DRegion" />
+			<param index="1" name="commit" type="bool" default="true" />
+			<description>
+				Project Alpha fork. Adds [param region] at its location, or replaces the region already there, and uploads only its layer. Fails when the capacity is reached. Set [param commit] to false when adding several regions, then call [method stream_commit].
+			</description>
+		</method>
+		<method name="stream_commit">
+			<return type="void" />
+			<description>
+				Project Alpha fork. Notifies the material, mesh bounds, collision and instancer about stream changes made with [param commit] set to false. Does nothing if nothing changed.
+			</description>
+		</method>
+		<method name="stream_remove_region">
+			<return type="void" />
+			<param index="0" name="region_location" type="Vector2i" />
+			<param index="1" name="commit" type="bool" default="true" />
+			<description>
+				Project Alpha fork. Removes the region at [param region_location] and frees it. The last active region moves into the freed layer, which costs one layer upload. Set [param commit] to false when removing several regions, then call [method stream_commit].
+			</description>
+		</method>
+		<method name="stream_shift">
+			<return type="int" enum="Error" />
+			<param index="0" name="offset" type="Vector2i" />
+			<param index="1" name="commit" type="bool" default="true" />
+			<description>
+				Project Alpha fork. Floating origin support. Moves every active region by -[param offset] region units by rewriting the region map, without uploading textures. Fails without changes if a region would leave the region map. Move your own nodes by [code]offset * region_size * vertex_spacing[/code] in the same frame.
 			</description>
 		</method>
 		<method name="update_maps">

@@ -596,6 +596,179 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 	emit_signal("maps_changed");
 }
 
+
+///////////////////////////
+// Streaming mode (Project Alpha fork)
+///////////////////////////
+
+// Allocates the texture arrays once with p_capacity layers. Existing active regions keep their layers.
+Error Terrain3DData::enable_streaming(const int p_capacity) {
+	if (p_capacity <= 0 || p_capacity > REGION_MAP_SIZE * REGION_MAP_SIZE) {
+		LOG(ERROR, "Streaming capacity must be 1 to ", REGION_MAP_SIZE * REGION_MAP_SIZE);
+		return ERR_INVALID_PARAMETER;
+	}
+	if (p_capacity < _region_locations.size()) {
+		LOG(ERROR, "Streaming capacity ", p_capacity, " is less than the active region count ", _region_locations.size());
+		return ERR_INVALID_PARAMETER;
+	}
+	// Make sure region map, locations and arrays reflect the current regions before we take over.
+	update_maps(TYPE_MAX, true, false);
+
+	Ref<Terrain3DRegion> blank;
+	blank.instantiate();
+	blank->set_region_size(_region_size);
+	blank->set_vertex_spacing(_vertex_spacing);
+	blank->sanitize_maps();
+
+	_height_maps.clear();
+	_control_maps.clear();
+	_color_maps.clear();
+	for (int i = 0; i < p_capacity; i++) {
+		Terrain3DRegion *region = (i < _region_locations.size()) ? get_region_ptr(Vector2i(_region_locations[i])) : blank.ptr();
+		_height_maps.push_back(region->get_height_map());
+		_control_maps.push_back(region->get_control_map());
+		_color_maps.push_back(region->get_color_map());
+	}
+	_generated_height_maps.clear();
+	_generated_control_maps.clear();
+	_generated_color_maps.clear();
+	_generated_height_maps.create(_height_maps);
+	_generated_control_maps.create(_control_maps);
+	_generated_color_maps.create(_color_maps);
+	_stream_capacity = p_capacity;
+	_stream_layers_changed = true;
+	LOG(INFO, "Streaming enabled with ", p_capacity, " layers");
+	stream_commit();
+	return OK;
+}
+
+void Terrain3DData::_stream_upload_layer(const Terrain3DRegion *p_region, const int p_layer) {
+	_height_maps[p_layer] = p_region->get_height_map();
+	_control_maps[p_layer] = p_region->get_control_map();
+	_color_maps[p_layer] = p_region->get_color_map();
+	_generated_height_maps.update(p_region->get_height_map(), p_layer);
+	_generated_control_maps.update(p_region->get_control_map(), p_layer);
+	_generated_color_maps.update(p_region->get_color_map(), p_layer);
+	_stream_layers_changed = true;
+}
+
+// Adds a region or replaces the one at its location. Uploads one layer.
+Error Terrain3DData::stream_add_region(const Ref<Terrain3DRegion> &p_region, const bool p_commit) {
+	ERR_FAIL_COND_V_MSG(!is_streaming(), ERR_UNCONFIGURED, "Call enable_streaming() first");
+	ERR_FAIL_COND_V(p_region.is_null(), ERR_INVALID_PARAMETER);
+	Vector2i region_loc = p_region->get_location();
+	int map_index = get_region_map_index(region_loc);
+	if (map_index < 0) {
+		LOG(ERROR, "Location ", region_loc, " out of bounds. Max: ", -REGION_MAP_SIZE / 2, " to ", REGION_MAP_SIZE / 2 - 1);
+		return ERR_PARAMETER_RANGE_ERROR;
+	}
+	if (p_region->get_region_size() != _region_size) {
+		LOG(ERROR, "Region size ", p_region->get_region_size(), " doesn't match terrain region size ", _region_size);
+		return ERR_INVALID_PARAMETER;
+	}
+	p_region->sanitize_maps();
+	p_region->set_deleted(false);
+	int layer = get_region_id(region_loc);
+	if (layer < 0) {
+		if (_region_locations.size() >= _stream_capacity) {
+			LOG(ERROR, "Streaming capacity ", _stream_capacity, " reached");
+			return ERR_OUT_OF_MEMORY;
+		}
+		layer = _region_locations.size();
+		_region_locations.push_back(region_loc);
+		_region_map[map_index] = layer + 1;
+	}
+	_regions[region_loc] = p_region;
+	_stream_upload_layer(p_region.ptr(), layer);
+	update_master_heights(p_region->get_height_range());
+	if (p_commit) {
+		stream_commit();
+	}
+	return OK;
+}
+
+// Removes a region and forgets it. The last active region moves into the freed layer, so layers stay
+// packed; that costs one layer upload unless the removed region was the last one.
+void Terrain3DData::stream_remove_region(const Vector2i &p_region_loc, const bool p_commit) {
+	ERR_FAIL_COND_MSG(!is_streaming(), "Call enable_streaming() first");
+	int layer = get_region_id(p_region_loc);
+	if (layer < 0) {
+		LOG(ERROR, "No active region at ", p_region_loc);
+		return;
+	}
+	int last = _region_locations.size() - 1;
+	if (layer != last) {
+		Vector2i last_loc = _region_locations[last];
+		_region_locations[layer] = last_loc;
+		_region_map[get_region_map_index(last_loc)] = layer + 1;
+		_stream_upload_layer(get_region_ptr(last_loc), layer);
+	}
+	_region_locations.remove_at(last);
+	_region_map[get_region_map_index(p_region_loc)] = 0;
+	Terrain3DRegion *region = get_region_ptr(p_region_loc);
+	if (region) {
+		region->set_deleted(true);
+	}
+	_regions.erase(p_region_loc);
+	_stream_layers_changed = true;
+	if (p_commit) {
+		stream_commit();
+	}
+}
+
+// Floating origin: every active region moves by -p_offset region units. No texture uploads.
+Error Terrain3DData::stream_shift(const Vector2i &p_offset, const bool p_commit) {
+	ERR_FAIL_COND_V_MSG(!is_streaming(), ERR_UNCONFIGURED, "Call enable_streaming() first");
+	if (p_offset == V2I_ZERO) {
+		return OK;
+	}
+	for (int i = 0; i < _region_locations.size(); i++) {
+		Vector2i new_loc = Vector2i(_region_locations[i]) - p_offset;
+		if (get_region_map_index(new_loc) < 0) {
+			LOG(ERROR, "Shift by ", p_offset, " moves region ", _region_locations[i], " out of bounds. Remove it first");
+			return ERR_PARAMETER_RANGE_ERROR;
+		}
+	}
+	Dictionary moved;
+	TypedArray<Vector2i> new_locations;
+	_region_map.fill(0);
+	for (int i = 0; i < _region_locations.size(); i++) {
+		Vector2i old_loc = _region_locations[i];
+		Vector2i new_loc = old_loc - p_offset;
+		Ref<Terrain3DRegion> region = _regions[old_loc];
+		region->set_location(new_loc);
+		moved[new_loc] = region;
+		new_locations.push_back(new_loc);
+		_region_map[get_region_map_index(new_loc)] = i + 1;
+	}
+	_regions = moved;
+	_region_locations = new_locations;
+	_stream_layers_changed = true;
+	_stream_regions_moved = true;
+	if (p_commit) {
+		stream_commit();
+	}
+	return OK;
+}
+
+// Tells the material, mesher AABBs, collision and instancer about changes since the last commit.
+void Terrain3DData::stream_commit() {
+	if (!_stream_layers_changed) {
+		return;
+	}
+	_stream_layers_changed = false;
+	_region_map_dirty = false;
+	emit_signal("region_map_changed");
+	emit_signal("height_maps_changed");
+	emit_signal("control_maps_changed");
+	emit_signal("color_maps_changed");
+	emit_signal("maps_changed");
+	if (_stream_regions_moved) {
+		_stream_regions_moved = false;
+		_terrain->get_instancer()->update_mmis(true);
+	}
+}
+
 void Terrain3DData::set_pixel(const MapType p_map_type, const Vector3 &p_global_position, const Color &p_pixel) {
 	if (p_map_type < 0 || p_map_type >= TYPE_MAX) {
 		LOG(ERROR, "Specified map type out of range");
@@ -1125,6 +1298,13 @@ void Terrain3DData::print_audit_data() const {
 ///////////////////////////
 
 void Terrain3DData::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("enable_streaming", "capacity"), &Terrain3DData::enable_streaming);
+	ClassDB::bind_method(D_METHOD("is_streaming"), &Terrain3DData::is_streaming);
+	ClassDB::bind_method(D_METHOD("get_stream_capacity"), &Terrain3DData::get_stream_capacity);
+	ClassDB::bind_method(D_METHOD("stream_add_region", "region", "commit"), &Terrain3DData::stream_add_region, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("stream_remove_region", "region_location", "commit"), &Terrain3DData::stream_remove_region, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("stream_shift", "offset", "commit"), &Terrain3DData::stream_shift, DEFVAL(true));
+	ClassDB::bind_method(D_METHOD("stream_commit"), &Terrain3DData::stream_commit);
 	BIND_ENUM_CONSTANT(HEIGHT_FILTER_NEAREST);
 	BIND_ENUM_CONSTANT(HEIGHT_FILTER_MINIMUM);
 

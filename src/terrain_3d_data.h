@@ -69,6 +69,12 @@ private:
 
 	// 32x32 grid with region_id:int at its location, no region = 0, region_ids >= 1
 	PackedInt32Array _region_map;
+
+	// Streaming mode
+	int _stream_capacity = 0;
+	bool _stream_layers_changed = false;
+	bool _stream_regions_moved = false;
+	void _stream_upload_layer(const Terrain3DRegion *p_region, const int p_layer);
 	bool _region_map_dirty = true;
 
 	// These contain the TextureArray RIDs from the RenderingServer
@@ -134,6 +140,17 @@ public:
 	TypedArray<Image> get_color_maps() const { return _color_maps; }
 	TypedArray<Image> get_maps(const MapType p_map_type) const;
 	void update_maps(const MapType p_map_type = TYPE_MAX, const bool p_all_regions = true, const bool p_generate_mipmaps = false);
+
+	// Streaming mode (Project Alpha fork). Texture arrays are allocated once with a fixed number of
+	// layers. Adding or removing a region uploads a single layer, and shifting the origin only rewrites
+	// the region map. Don't mix with add_region()/remove_region()/update_maps() while enabled.
+	Error enable_streaming(const int p_capacity);
+	bool is_streaming() const { return _stream_capacity > 0; }
+	int get_stream_capacity() const { return _stream_capacity; }
+	Error stream_add_region(const Ref<Terrain3DRegion> &p_region, const bool p_commit = true);
+	void stream_remove_region(const Vector2i &p_region_loc, const bool p_commit = true);
+	Error stream_shift(const Vector2i &p_offset, const bool p_commit = true);
+	void stream_commit();
 	RID get_height_maps_rid() const { return _generated_height_maps.get_rid(); }
 	RID get_control_maps_rid() const { return _generated_control_maps.get_rid(); }
 	RID get_color_maps_rid() const { return _generated_color_maps.get_rid(); }

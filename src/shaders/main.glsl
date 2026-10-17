@@ -74,6 +74,8 @@ uniform float blend_sharpness : hint_range(0, 1) = 0.5;
 uniform bool flat_terrain_normals = false;
 uniform bool enable_projection = true;
 uniform float projection_threshold : hint_range(0.0, 0.99, 0.01) = 0.8;
+// Half the width (in normal.y) of the band in which planar and projected mapping blend.
+#define PROJECTION_BAND 0.06
 
 uniform float mipmap_bias : hint_range(0.5, 1.5, 0.01) = 1.0;
 uniform float depth_blur : hint_range(0.0, 35.0, 0.1) = 0.0;
@@ -214,7 +216,7 @@ vec2 rotate_vec2(const vec2 v, const vec2 cs) {
 // 2-4 lookups ( 2-6 with dual scaling )
 void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float weight, const ivec3 index,
 			const uint control, const vec2 texture_weight, const ivec2 texture_id, const vec3 i_normal,
-			const float h, inout material mat) {
+			const float h, const vec3 p_normal, const bool project, inout material mat) {
 
 	// Index position for detiling.
 	vec2 i_pos = fma(_region_locations[index.z], vec2(_region_size), vec2(index.xy)) * _vertex_spacing;
@@ -223,11 +225,13 @@ void accumulate_material(const vec3 base_ddx, const vec3 base_ddy, const float w
 	vec2 i_uv = v_vertex.xz;
 	vec4 i_dd = vec4(base_ddx.xz, base_ddy.xz);
 	mat2 p_align = mat2(1.);
-	if (i_normal.y <= projection_threshold && enable_projection) {
+	// Decided once per pixel from p_normal, the interpolated normal (see projection_blend): with
+	// each corner's own normal, corners either side of the threshold smeared both mappings together.
+	if (project) {
 		// Projected normal map alignment matrix
-		p_align = mat2(vec2(i_normal.z, -i_normal.x), vec2(i_normal.x, i_normal.z));
+		p_align = mat2(vec2(p_normal.z, -p_normal.x), vec2(p_normal.x, p_normal.z));
 		// Fast 45 degree snapping https://iquilezles.org/articles/noatan/
-		vec2 xz = round(normalize(-i_normal.xz) * 1.3065629648763765); // sqrt(1.0 + sqrt(0.5))
+		vec2 xz = round(normalize(-p_normal.xz) * 1.3065629648763765); // sqrt(1.0 + sqrt(0.5))
 		xz *= abs(xz.x) + abs(xz.y) > 1.5 ? 0.7071067811865475 : 1.0; // sqrt(0.5)
 		xz = vec2(-xz.y, xz.x);
 		i_pos = floor(vec2(dot(i_pos, xz), -h));
@@ -511,18 +515,29 @@ void fragment() {
 	// Struct to accumulate all texture data.
 	material mat = material(vec4(0.0), vec4(0.0), 0., 0., 0.);
 
-	// 2 - 4 lookups, 2 - 6 if dual scale texture
-	accumulate_material(base_ddx, base_ddy, weights[3], index[3], control[3], t_weights[3],
-		texture_ids[3], index_normal[3], h[3], mat);
+	// Planar below the projection threshold, projected above it, and both blended across a band
+	// around it so that no seam shows where the slope crosses it.
+	vec3 p_normal = normalize(w_normal);
+	float projection_blend = enable_projection ?
+		smoothstep(projection_threshold + PROJECTION_BAND, projection_threshold - PROJECTION_BAND, p_normal.y) : 0.0;
+	#define ACCUMULATE(k) \
+		if (projection_blend < 1.0) { \
+			accumulate_material(base_ddx, base_ddy, weights[k] * (1.0 - projection_blend), index[k], control[k], t_weights[k], \
+				texture_ids[k], index_normal[k], h[k], p_normal, false, mat); \
+		} \
+		if (projection_blend > 0.0) { \
+			accumulate_material(base_ddx, base_ddy, weights[k] * projection_blend, index[k], control[k], t_weights[k], \
+				texture_ids[k], index_normal[k], h[k], p_normal, true, mat); \
+		}
+
+	// 2 - 4 lookups, 2 - 6 if dual scale texture (twice in the projection band)
+	ACCUMULATE(3)
 
 	// 6 - 12 lookups, 6 - 18 if dual scale texture
 	if (bilerp) {
-		accumulate_material(base_ddx, base_ddy, weights[2], index[2], control[2], t_weights[2],
-			texture_ids[2], index_normal[2], h[2], mat);
-		accumulate_material(base_ddx, base_ddy, weights[1], index[1], control[1], t_weights[1],
-			texture_ids[1], index_normal[1], h[1], mat);
-		accumulate_material(base_ddx, base_ddy, weights[0], index[0], control[0], t_weights[0],
-			texture_ids[0], index_normal[0], h[0], mat);
+		ACCUMULATE(2)
+		ACCUMULATE(1)
+		ACCUMULATE(0)
 	}
 
 	// normalize accumulated values back to 0.0 - 1.0 range.
